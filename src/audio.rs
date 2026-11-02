@@ -117,10 +117,16 @@ struct Session {
     name: String,
     sid: String, // GetSessionIdentifier: app + device, survives the session being recreated
     root: u32,
-    vol: ISimpleAudioVolume,
+    vol: ISimpleAudioVolume, // the user's own volume (what mixers show and set): read, never ducked
+    // Ducking lowers the per-channel volumes instead, which multiply with the user's and no mixer touches, so the
+    // user can change an app's volume mid-duck without AudioDuck overwriting it or putting an old value back.
+    chan: IChannelAudioVolume,
     meter: IAudioMeterInformation,
-    base: f32,             // user's own volume, restored when ducking ends
-    last_set: Option<f32>, // what we last wrote; None = we're not touching this session
+    last_set: Option<f32>, // gain we last wrote to every channel; None = channels untouched
+}
+
+fn set_channels(chan: &IChannelAudioVolume, g: f32) -> bool {
+    unsafe { chan.GetChannelCount().and_then(|n| chan.SetAllVolumes(&vec![g; n as usize], &CTX)) }.is_ok()
 }
 
 pub struct Mixer {
@@ -131,11 +137,16 @@ pub struct Mixer {
     // session: a session only shows up on the next refresh, which made the first second of a new sound go unnoticed.
     watched: HashMap<u32, String>,
     state_path: PathBuf,
-    // Windows remembers per-app volume, so sessions that vanish while ducked (or all of them, if we died) get the
-    // user's volume back when they reappear. Keyed by session identifier.
-    pending_restore: HashMap<String, f32>,
-    saved: HashMap<String, f32>,
+    // Windows remembers per-app channel volumes, so sessions that vanish while ducked (or all of them, if we died) get
+    // full channels back when they reappear. Keyed by session identifier.
+    pending_restore: HashSet<String>,
+    saved: HashSet<String>,
+    // Builds before channel ducking lowered the user's volume itself and left sid -> their volume in LEGACY_STATE for
+    // sessions that vanished ducked; each gets it back once, when it reappears.
+    legacy: HashMap<String, f32>,
 }
+
+const LEGACY_STATE: &str = "ducked_state.json";
 
 /// pid -> (lowercase exe name, parent pid)
 pub fn processes() -> HashMap<u32, (String, u32)> {
@@ -168,8 +179,9 @@ fn root_pid(procs: &HashMap<u32, (String, u32)>, pid: u32, name: &str) -> u32 {
 
 impl Mixer {
     pub fn new(state_path: PathBuf) -> Self {
-        let pending: HashMap<String, f32> = std::fs::read_to_string(&state_path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        Self { sessions: HashMap::new(), loopbacks: HashMap::new(), watched: HashMap::new(), state_path, saved: pending.clone(), pending_restore: pending }
+        let pending: HashSet<String> = std::fs::read_to_string(&state_path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let legacy = std::fs::read_to_string(state_path.with_file_name(LEGACY_STATE)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        Self { sessions: HashMap::new(), loopbacks: HashMap::new(), watched: HashMap::new(), state_path, saved: pending.clone(), pending_restore: pending, legacy }
     }
 
     /// `measure(app)`: whether that app needs an accurate level (each loopback costs a capture pipeline).
@@ -178,7 +190,7 @@ impl Mixer {
         let procs = processes();
         let me = std::process::id();
         let mut found = HashMap::new();
-        let mut restored = HashSet::new();
+        let mut legacy_hit = false;
         unsafe {
             let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return };
             let Ok(devices) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return };
@@ -198,27 +210,30 @@ impl Mixer {
                         continue;
                     }
                     let Some((name, _)) = procs.get(&pid) else { continue };
-                    let (Ok(vol), Ok(meter)) = (ctl.cast::<ISimpleAudioVolume>(), ctl.cast::<IAudioMeterInformation>()) else { continue };
+                    let (Ok(vol), Ok(chan), Ok(meter)) = (ctl.cast::<ISimpleAudioVolume>(), ctl.cast::<IChannelAudioVolume>(), ctl.cast::<IAudioMeterInformation>()) else { continue };
                     let Ok(sid) = ctl.GetSessionIdentifier() else { continue };
                     let sid_str = sid.to_string().unwrap_or_default();
                     CoTaskMemFree(Some(sid.0 as _));
-                    // A session recreated while we had it ducked starts at the ducked volume (Windows persists it):
-                    // put the user's volume back first, or the ducked level would become the new baseline.
-                    if let Some(v) = self.pending_restore.remove(&sid_str) {
+                    // A session recreated while we had it ducked starts with the ducked channels (Windows persists them).
+                    if self.pending_restore.remove(&sid_str) {
+                        set_channels(&chan, 1.0);
+                    }
+                    if let Some(v) = self.legacy.remove(&sid_str) {
                         let _ = vol.SetMasterVolume(v, &CTX);
-                    } else if let Some(&v) = self.pending_restore.get(name) {
-                        let _ = vol.SetMasterVolume(v, &CTX); // old state files were keyed by app name
-                        restored.insert(name.clone()); // removed after the loop: the app may have a session per device
+                        legacy_hit = true;
                     }
                     let root = root_pid(&procs, pid, name);
-                    found.insert(key, Session { name: name.clone(), sid: sid_str, root, vol, meter, base: 1.0, last_set: None });
+                    found.insert(key, Session { name: name.clone(), sid: sid_str, root, vol, chan, meter, last_set: None });
                 }
             }
         }
-        self.pending_restore.retain(|name, _| !restored.contains(name));
+        if legacy_hit {
+            let path = self.state_path.with_file_name(LEGACY_STATE);
+            let _ = if self.legacy.is_empty() { std::fs::remove_file(path) } else { std::fs::write(path, serde_json::to_string(&self.legacy).unwrap_or_default()) };
+        }
         for s in self.sessions.values_mut() {
             if s.last_set.is_some() {
-                self.pending_restore.insert(s.sid.clone(), s.base); // in case it comes back with the ducked volume
+                self.pending_restore.insert(s.sid.clone()); // in case it comes back with the ducked channels
             }
             restore(s); // best effort: the session is usually gone already
         }
@@ -262,20 +277,12 @@ impl Mixer {
             if s.last_set.is_none() && g >= 1.0 {
                 continue; // not ducked and not about to be: no COM calls
             }
-            // The user's volume is read once, when ducking starts. Never re-derive it from the current volume while
-            // ducked: other apps write it too (Discord's attenuation), and treating their writes as the user's
-            // made the baseline ratchet down a bit more on every duck.
-            if s.last_set.is_none() {
-                let Ok(cur) = (unsafe { s.vol.GetMasterVolume() }) else { continue };
-                s.base = cur;
-            }
             if g >= 1.0 {
                 restore(s);
                 continue;
             }
-            let v = s.base * g;
-            if s.last_set.is_none_or(|last| (v - last).abs() > 0.001) && unsafe { s.vol.SetMasterVolume(v, &CTX) }.is_ok() {
-                s.last_set = Some(v);
+            if s.last_set.is_none_or(|last| (g - last).abs() > 0.001) && set_channels(&s.chan, g) {
+                s.last_set = Some(g);
             }
         }
         self.save_state();
@@ -286,17 +293,14 @@ impl Mixer {
         self.save_state();
     }
 
-    /// User-facing volume of each app (its pre-duck level if ducked).
+    /// User-facing volume of each app (ducking doesn't change it).
     pub fn volumes(&self) -> HashMap<String, f32> {
-        self.sessions
-            .values()
-            .filter_map(|s| Some((s.name.clone(), if s.last_set.is_some() { s.base } else { unsafe { s.vol.GetMasterVolume() }.ok()? })))
-            .collect()
+        self.sessions.values().filter_map(|s| Some((s.name.clone(), unsafe { s.vol.GetMasterVolume() }.ok()?))).collect()
     }
 
     fn save_state(&mut self) {
-        let mut ducked: HashMap<String, f32> = self.sessions.values().filter(|s| s.last_set.is_some()).map(|s| (s.sid.clone(), s.base)).collect();
-        ducked.extend(self.pending_restore.iter().map(|(k, v)| (k.clone(), *v)));
+        let mut ducked: HashSet<String> = self.sessions.values().filter(|s| s.last_set.is_some()).map(|s| s.sid.clone()).collect();
+        ducked.extend(self.pending_restore.iter().cloned());
         if ducked != self.saved {
             let _ = std::fs::write(&self.state_path, serde_json::to_string(&ducked).unwrap_or_default());
             self.saved = ducked;
@@ -306,7 +310,7 @@ impl Mixer {
 
 fn restore(s: &mut Session) {
     if s.last_set.is_some() {
-        let _ = unsafe { s.vol.SetMasterVolume(s.base, &CTX) };
+        set_channels(&s.chan, 1.0);
     }
     s.last_set = None;
 }

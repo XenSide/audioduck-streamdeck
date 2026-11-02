@@ -281,9 +281,7 @@ impl Mixer {
                 restore(s);
                 continue;
             }
-            // Channel volumes are linear amplitude, the master volume `level` was tuned on is about squared (measured:
-            // 0.5 gives -12 dB on master, -6 dB on channels), so square the gain to keep a duck as deep as it was.
-            if s.last_set.is_none_or(|last| (g - last).abs() > 0.001) && set_channels(&s.chan, g * g) {
+            if s.last_set.is_none_or(|last| (g - last).abs() > 0.001) && set_channels(&s.chan, g) {
                 s.last_set = Some(g);
             }
         }

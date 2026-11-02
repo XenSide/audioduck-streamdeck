@@ -71,7 +71,7 @@ pub fn save_config(c: &Config) {
 /// Audio loop. Owns every COM object; talks to the plugin side only through `Shared`.
 fn engine(shared: SharedRef) {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let mut mixer = audio::Mixer::new(app_dir().join("ducked_state.json"));
+    let mut mixer = audio::Mixer::new(app_dir().join("ducked_channels.json"));
     let (mut cfg, mut rules) = { let sh = shared.lock().unwrap(); (sh.config.clone(), sh.rules.clone()) };
     let mut ducker = Ducker::default();
     let mut rev = u64::MAX;
